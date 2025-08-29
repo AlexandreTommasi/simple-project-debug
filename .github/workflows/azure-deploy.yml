@@ -1,0 +1,210 @@
+name: Deploy to Azure Web App
+
+on:
+  workflow_dispatch:
+  # Push trigger comentado para evitar deploy automático no primeiro commit
+  # Descomente as linhas abaixo se quiser deploy automático em futuros pushes:
+  # push:
+  #   branches:
+  #     - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js version
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22.x'
+
+      - name: npm install, build, and test
+        run: |
+          # Build frontend
+          cd frontend
+          npm install
+          npm run build
+          cd ..
+          
+          # Build backend
+          cd backend
+          echo "Installing backend dependencies..."
+          npm install
+          
+          # Check if TypeScript needs to be compiled
+          if [ -f "tsconfig.json" ]; then
+            echo "TypeScript project detected, building..."
+            npm run build
+            
+            # Verify build succeeded
+            if [ -d "dist" ]; then
+              echo "✓ Build successful - dist folder created"
+              echo "Files in dist:"
+              ls -la dist/
+            else
+              echo "✗ Build FAILED - no dist folder!"
+              echo "Trying direct tsc compilation..."
+              npx tsc
+              
+              if [ -d "dist" ]; then
+                echo "✓ Direct tsc compilation successful"
+              else
+                echo "✗ Compilation failed completely!"
+                exit 1
+              fi
+            fi
+          else
+            echo "JavaScript project (no tsconfig.json)"
+            npm run build --if-present
+          fi
+          
+          npm run test --if-present -- --passWithNoTests
+          
+          # Copy frontend build to backend public folder
+          mkdir -p public
+          cp -r ../frontend/dist/* public/ || cp -r ../frontend/build/* public/
+          
+          # Create web.config for Azure IIS
+          cat > web.config << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <system.webServer>
+              <handlers>
+                <add name="iisnode" path="server.js" verb="*" modules="iisnode"/>
+              </handlers>
+              <rewrite>
+                <rules>
+                  <rule name="DynamicContent">
+                    <conditions>
+                      <add input="{REQUEST_FILENAME}" matchType="IsFile" negate="True"/>
+                    </conditions>
+                    <action type="Rewrite" url="server.js"/>
+                  </rule>
+                </rules>
+              </rewrite>
+              <httpErrors existingResponse="PassThrough" />
+              <iisnode node_env="production" />
+            </system.webServer>
+          </configuration>
+          EOF
+          
+          # Create server.js entry point with error handling
+          cat > server.js << 'EOF'
+          // Azure App Service Entry Point with Debug
+          console.log('[STARTUP] Starting Azure App Service...');
+          console.log('[STARTUP] Current directory:', __dirname);
+          console.log('[STARTUP] Node version:', process.version);
+          console.log('[STARTUP] Environment:', process.env.NODE_ENV);
+          
+          const fs = require('fs');
+          const path = require('path');
+          
+          // List files in current directory
+          console.log('[STARTUP] Files in root:');
+          fs.readdirSync('.').forEach(file => {
+            console.log('  -', file);
+          });
+          
+          // Check if dist exists
+          if (fs.existsSync('./dist')) {
+            console.log('[STARTUP] dist/ folder found');
+            console.log('[STARTUP] Files in dist:');
+            fs.readdirSync('./dist').forEach(file => {
+              console.log('  -', file);
+            });
+          } else {
+            console.error('[ERROR] dist/ folder NOT found!');
+          }
+          
+          // Check if dist/server.js exists
+          const serverPath = './dist/server.js';
+          if (fs.existsSync(serverPath)) {
+            console.log('[STARTUP] Loading', serverPath);
+            try {
+              require(serverPath);
+            } catch (error) {
+              console.error('[ERROR] Failed to load server:', error);
+              process.exit(1);
+            }
+          } else {
+            console.error('[ERROR] File not found:', serverPath);
+            console.error('[ERROR] Cannot start server!');
+            process.exit(1);
+          }
+          EOF
+          
+          # Update package.json start script
+          node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync('package.json')); p.scripts.start='node server.js'; fs.writeFileSync('package.json', JSON.stringify(p,null,2));"
+          
+          cd ..
+
+      - name: Zip artifact for deployment
+        run: |
+          cd backend
+          
+          # List what we're about to zip
+          echo "Files to be zipped:"
+          ls -la
+          
+          # Check if critical files exist
+          echo "Checking critical files:"
+          [ -f "server.js" ] && echo "✓ server.js found" || echo "✗ server.js NOT found"
+          [ -f "web.config" ] && echo "✓ web.config found" || echo "✗ web.config NOT found"
+          [ -f "package.json" ] && echo "✓ package.json found" || echo "✗ package.json NOT found"
+          [ -d "dist" ] && echo "✓ dist/ folder found" || echo "✗ dist/ folder NOT found"
+          [ -d "public" ] && echo "✓ public/ folder found" || echo "✗ public/ folder NOT found"
+          
+          if [ -d "dist" ]; then
+            echo "Contents of dist folder:"
+            ls -la dist/
+          fi
+          
+          # Create the zip
+          zip -r ../release.zip . -x "node_modules/*" ".git/*" "src/*" "*.ts"
+          cd ..
+          
+          # Show zip contents
+          echo "ZIP contents (first 30 files):"
+          unzip -l release.zip | head -30
+
+      - name: Upload artifact for deployment job
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-app
+          path: release.zip
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: 'Production'
+      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+    
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: node-app
+
+      - name: Unzip artifact for deployment
+        run: unzip release.zip
+      
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: 'Deploy to Azure Web App'
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: 'expandev-02'
+          package: .
